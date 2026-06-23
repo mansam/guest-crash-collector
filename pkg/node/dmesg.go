@@ -14,8 +14,8 @@ import (
 )
 
 func GetDmesg(ctx context.Context, client kubernetes.Interface, nodeName string, since, until time.Time, debugImage string) ([]byte, error) {
-	sinceStr := since.Format("2006-01-02T15:04:05-0700")
-	untilStr := until.Format("2006-01-02T15:04:05-0700")
+	sinceStr := since.UTC().Format("2006-01-02 15:04:05")
+	untilStr := until.UTC().Format("2006-01-02 15:04:05")
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -25,16 +25,25 @@ func GetDmesg(ctx context.Context, client kubernetes.Interface, nodeName string,
 		Spec: corev1.PodSpec{
 			NodeName:      nodeName,
 			RestartPolicy: corev1.RestartPolicyNever,
-			HostPID:       true,
+			Volumes: []corev1.Volume{{
+				Name: "host",
+				VolumeSource: corev1.VolumeSource{
+					HostPath: &corev1.HostPathVolumeSource{Path: "/"},
+				},
+			}},
 			Containers: []corev1.Container{{
 				Name:  "debug",
 				Image: debugImage,
 				Command: []string{
-					"nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+					"chroot", "/host",
 					"dmesg", "--time-format", "iso",
 					"--since", sinceStr,
 					"--until", untilStr,
 				},
+				VolumeMounts: []corev1.VolumeMount{{
+					Name:      "host",
+					MountPath: "/host",
+				}},
 				SecurityContext: &corev1.SecurityContext{
 					Privileged: ptr.To(true),
 				},
