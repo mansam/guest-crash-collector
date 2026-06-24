@@ -15,9 +15,6 @@ var (
 	VMIGVR = schema.GroupVersionResource{
 		Group: "kubevirt.io", Version: "v1", Resource: "virtualmachineinstances",
 	}
-	RouteGVR = schema.GroupVersionResource{
-		Group: "route.openshift.io", Version: "v1", Resource: "routes",
-	}
 )
 
 type Clients struct {

@@ -12,9 +12,9 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/mansam/guest-crash-collector/pkg/archive"
+	"github.com/mansam/guest-crash-collector/pkg/guestfs"
 	"github.com/mansam/guest-crash-collector/pkg/kube"
 	"github.com/mansam/guest-crash-collector/pkg/node"
-	"github.com/mansam/guest-crash-collector/pkg/prometheus"
 )
 
 func Run(ctx context.Context, cfg Config) error {
@@ -41,78 +41,75 @@ func Run(ctx context.Context, cfg Config) error {
 		Data:     vmYAML,
 	})
 
-	// Step 2: Determine which node the VM was running on
-	var nodeName string
-	var vmiObj *unstructured.Unstructured
-
-	fmt.Fprintf(os.Stderr, "Querying Prometheus for node at %s...\n", cfg.CrashTime.Format("2006-01-02T15:04:05Z07:00"))
-	nodeName, err = prometheus.QueryNodeAtTime(ctx, clients.Dynamic, clients.RestConfig, cfg.Namespace, cfg.VMName, cfg.PrometheusURL, cfg.CrashTime)
+	// Step 2: Get VMI to determine the node
+	fmt.Fprintf(os.Stderr, "Fetching VirtualMachineInstance %s/%s...\n", cfg.Namespace, cfg.VMName)
+	vmiObj, nodeName, err := getVMINodeName(ctx, clients, cfg.Namespace, cfg.VMName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: Prometheus query failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Falling back to current VMI to determine node...\n")
-
-		vmiObj, nodeName, err = getVMINodeName(ctx, clients, cfg.Namespace, cfg.VMName)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: Cannot determine node (no Prometheus data and no active VMI): %v\n", err)
-			fmt.Fprintf(os.Stderr, "Skipping node and pod log collection.\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "WARNING: Using current VMI node '%s' — this may differ from the crash-time node.\n", nodeName)
-		}
+		return fmt.Errorf("VM must be running to collect crash context: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "VM is running on node %s\n", nodeName)
+
+	vmiYAML, err := yaml.Marshal(vmiObj.Object)
+	if err != nil {
+		return fmt.Errorf("marshaling VMI to YAML: %w", err)
+	}
+	artifacts = append(artifacts, archive.Artifact{
+		Filename: fmt.Sprintf("virtualmachineinstance-%s.yaml", cfg.VMName),
+		Data:     vmiYAML,
+	})
 
 	// Step 3: Get dmesg from the node
-	if nodeName != "" {
-		since := cfg.CrashTime.Add(-cfg.Window)
-		until := cfg.CrashTime.Add(cfg.Window)
-		fmt.Fprintf(os.Stderr, "Collecting dmesg from node %s (%s to %s)...\n", nodeName, since.Format("15:04:05"), until.Format("15:04:05"))
+	since := cfg.CrashTime.Add(-cfg.Window)
+	until := cfg.CrashTime.Add(cfg.Window)
+	fmt.Fprintf(os.Stderr, "Collecting dmesg from node %s (%s to %s)...\n", nodeName, since.Format("15:04:05"), until.Format("15:04:05"))
 
-		dmesgData, err := node.GetDmesg(ctx, clients.Kubernetes, nodeName, since, until, cfg.DebugImage)
+	dmesgData, err := node.GetDmesg(ctx, clients.Kubernetes, nodeName, since, until, cfg.DebugImage)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: Failed to collect dmesg from node %s: %v\n", nodeName, err)
+	} else {
+		artifacts = append(artifacts, archive.Artifact{
+			Filename: fmt.Sprintf("node-%s-dmesg.log", nodeName),
+			Data:     dmesgData,
+		})
+	}
+
+	// Step 4: Collect virt-launcher pod logs
+	podArtifacts, err := collectPodLogs(ctx, clients, cfg.Namespace, cfg.VMName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: Failed to collect pod logs: %v\n", err)
+	} else {
+		artifacts = append(artifacts, podArtifacts...)
+	}
+
+	// Step 5: Extract Windows crash dump (if requested)
+	if cfg.CollectDump {
+		fmt.Fprintf(os.Stderr, "Extracting Windows crash dump...\n")
+
+		pvcName, err := guestfs.ResolvePVCName(vm, cfg.DiskName)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: Failed to collect dmesg from node %s: %v\n", nodeName, err)
+			fmt.Fprintf(os.Stderr, "WARNING: Cannot resolve boot disk PVC: %v\n", err)
 		} else {
-			artifacts = append(artifacts, archive.Artifact{
-				Filename: fmt.Sprintf("node-%s-dmesg.log", nodeName),
-				Data:     dmesgData,
-			})
-		}
-	}
+			fmt.Fprintf(os.Stderr, "  Boot disk PVC: %s\n", pvcName)
 
-	// Step 4: If VMI exists on the same node, collect VMI YAML and pod logs
-	if nodeName != "" {
-		if vmiObj == nil {
-			vmiObj, _, err = getVMINodeName(ctx, clients, cfg.Namespace, cfg.VMName)
+			isBlock, err := guestfs.GetPVCVolumeMode(ctx, clients.Kubernetes, cfg.Namespace, pvcName)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "INFO: No active VMI found for %s/%s, skipping VMI and pod log collection.\n", cfg.Namespace, cfg.VMName)
-			}
-		}
-
-		if vmiObj != nil {
-			vmiNode, _, _ := unstructured.NestedString(vmiObj.Object, "status", "nodeName")
-			if vmiNode == nodeName {
-				vmiYAML, err := yaml.Marshal(vmiObj.Object)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "WARNING: Failed to marshal VMI YAML: %v\n", err)
-				} else {
-					artifacts = append(artifacts, archive.Artifact{
-						Filename: fmt.Sprintf("virtualmachineinstance-%s.yaml", cfg.VMName),
-						Data:     vmiYAML,
-					})
-				}
-
-				podArtifacts, err := collectPodLogs(ctx, clients, cfg.Namespace, cfg.VMName)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "WARNING: Failed to collect pod logs: %v\n", err)
-				} else {
-					artifacts = append(artifacts, podArtifacts...)
-				}
+				fmt.Fprintf(os.Stderr, "WARNING: Cannot determine PVC volume mode: %v\n", err)
 			} else {
-				fmt.Fprintf(os.Stderr, "INFO: VMI is now on node %s (crash was on %s), skipping VMI and pod log collection.\n", vmiNode, nodeName)
+				extracted, err := guestfs.ExtractCrashDump(ctx, clients.Kubernetes, clients.RestConfig, cfg.Namespace, pvcName, nodeName, isBlock, cfg.GuestfsImage)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "WARNING: Crash dump extraction failed: %v\n", err)
+				} else if len(extracted) > 0 {
+					fmt.Fprintf(os.Stderr, "Extracted crash dump files:\n")
+					for _, f := range extracted {
+						fmt.Fprintf(os.Stderr, "  %s (%d bytes)\n", f.LocalPath, f.Size)
+					}
+				}
 			}
 		}
 	}
 
-	// Step 5: Create archive
-	outputFile := fmt.Sprintf("vmi-crash-gather-%s-%s.tar.gz", cfg.VMName, cfg.CrashTime.Format("20060102-150405"))
+	// Step 6: Create archive
+	outputFile := fmt.Sprintf("guest-crash-collector-%s-%s.tar.gz", cfg.VMName, cfg.CrashTime.Format("20060102-150405"))
 	fmt.Fprintf(os.Stderr, "Creating archive %s...\n", outputFile)
 
 	if err := archive.Create(artifacts, outputFile); err != nil {

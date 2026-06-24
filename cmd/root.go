@@ -13,17 +13,19 @@ import (
 )
 
 var (
-	namespace     string
-	vmName        string
-	around        string
-	window        string
-	prometheusURL string
-	debugImage    string
-	kubeconfig    string
+	namespace    string
+	vmName       string
+	around       string
+	window       string
+	debugImage   string
+	kubeconfig   string
+	collectDump  bool
+	guestfsImage string
+	diskName     string
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "vmi-crash-gather",
+	Use:   "guest-crash-collector",
 	Short: "Gather diagnostic context for KubeVirt VM guest OS crashes",
 	Long: `Collects VM YAML, node dmesg logs, VMI YAML, and virt-launcher pod logs
 around a crash timestamp and packages them into a tarball for analysis.`,
@@ -47,13 +49,15 @@ around a crash timestamp and packages them into a tarball for analysis.`,
 		}
 
 		cfg := gather.Config{
-			Namespace:     namespace,
-			VMName:        vmName,
-			CrashTime:     crashTime,
-			Window:        dur,
-			PrometheusURL: prometheusURL,
-			DebugImage:    debugImage,
-			Kubeconfig:    kubeconfig,
+			Namespace:    namespace,
+			VMName:       vmName,
+			CrashTime:    crashTime,
+			Window:       dur,
+			DebugImage:   debugImage,
+			Kubeconfig:   kubeconfig,
+			CollectDump:  collectDump,
+			GuestfsImage: guestfsImage,
+			DiskName:     diskName,
 		}
 
 		return gather.Run(context.Background(), cfg)
@@ -65,9 +69,11 @@ func init() {
 	rootCmd.Flags().StringVarP(&vmName, "vm", "v", "", "name of the VM (required)")
 	rootCmd.Flags().StringVarP(&around, "around", "a", "", "crash timestamp in RFC3339 format (required)")
 	rootCmd.Flags().StringVarP(&window, "window", "w", "30m", "time window around crash (e.g. 30m, 1h)")
-	rootCmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Prometheus endpoint URL (auto-discovered if omitted)")
 	rootCmd.Flags().StringVar(&debugImage, "debug-image", "registry.access.redhat.com/ubi9/ubi-minimal", "container image for the debug pod")
 	rootCmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "path to kubeconfig (defaults to $KUBECONFIG or ~/.kube/config)")
+	rootCmd.Flags().BoolVar(&collectDump, "collect-dump", false, "extract Windows crash dump (MEMORY.DMP) from the VM's disk via libguestfs")
+	rootCmd.Flags().StringVar(&guestfsImage, "guestfs-image", "quay.io/kubevirt/libguestfs-tools:latest", "container image for the guestfs pod")
+	rootCmd.Flags().StringVar(&diskName, "disk", "", "VM volume name for the boot disk (default: first PVC/DataVolume volume)")
 
 	_ = rootCmd.MarkFlagRequired("namespace")
 	_ = rootCmd.MarkFlagRequired("vm")
